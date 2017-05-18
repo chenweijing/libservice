@@ -20,7 +20,7 @@ typedef void(*closecallback_t)(int fd, int err);
 typedef void(*connectcallback_t)(int fd);
 
 /* listen at port */
-SHARED_API void iosev(int port);
+SHARED_API void iosev(int port, bool isblock);
 
 /* connect service, if connect successful return fd else return -1. */
 SHARED_API int ioconnect(const char *ip, int port);
