@@ -1,4 +1,4 @@
-﻿/**
+/**
 * Copyright (c) 2017-present,chenwj;
 * All rights reserved.
 * NOTE: base on boost asio network framwork.
@@ -19,14 +19,13 @@
 #include <boost/asio/strand.hpp>
 #include <boost/asio/placeholders.hpp>
 
-#include "sigslot.h"
 #include "io_service_pool.h"
 #include "coder.h"
+#include "channel.hpp"
 
 using namespace boost::asio;
 using namespace boost::asio::ip;
 using namespace boost::system;
-using namespace sigslot;
 
 static const int MAX_PACKAGE_SIZE = 1024 * 30;
 static const int ACTIVE_TIME_OUT = 20;
@@ -42,65 +41,63 @@ struct socket_t{
 	int32_t readlen;
 	char buf[MAX_PACKAGE_SIZE];
 	std::time_t lastactivetime; /* last active time. */
+	bool isremote_client; /* is remote client socket */
+	bool islocal_client;  /* the socket connect remote server, loop send heart */
+	socket_t(){
+		isremote_client = false;
+		islocal_client = false;
+	}
 };
 
 /* global variables */
-static io_service_pool iopool(4);
+static std::shared_ptr<io_service_pool> iopool = NULL;
+static const int CPUCOUNT = 4;
 static std::shared_ptr<tcp::acceptor> acceptor = NULL;
 static int cfd = 0; /* the count of fds.*/
 static std::map < int/*fd*/, std::shared_ptr<socket_t>> fds;
 static std::mutex sktmtx, exitmtx, closemtx;
 static std::condition_variable exitcnd;
-static int flag = 0;
-static sigslot::signal1<int, multi_threaded_local> closesig;
+static int client_flag = 0, server_flag = 0;
+
 readcallback_t read_pfn = NULL;
 closecallback_t close_pfn = NULL;
 connectcallback_t conncet_pfn = NULL;
 
-/* onclose signal class */
-class CloseSlot : public has_slots<multi_threaded_local>
-{
-public:
-	void onClose(int fd);
-};
-void CloseSlot::onClose(int fd)
-{
-	lock_block<multi_threaded_local> lock(this);
-	if (close_pfn != NULL){
-		close_pfn(fd, -1);
-	}
-}
-
-static CloseSlot closeslot;
 
 /* callback functions */
 static void accept();
-static void addsocket(std::shared_ptr<socket_t> s);
-static void delsocket(std::shared_ptr<socket_t> s);
+static void addsocket(const std::shared_ptr<socket_t>& s);
+static void delsocket(const std::shared_ptr<socket_t>& s);
 static void delsocketbyfd(int fd);
 static std::shared_ptr<struct socket_t> getsocket(int fd);
-static void readheader(std::shared_ptr<socket_t> s);
+static void readheader(const std::shared_ptr<socket_t>& s);
 
-static void handleAccept(std::shared_ptr<socket_t> s, const error_code& error);
-static void handleReadHeader(std::shared_ptr<socket_t> s, const error_code& error, size_t bytes_transferred);
-static void handleReadBody(std::shared_ptr<socket_t> s, const error_code& error, std::size_t bytes_transferred);
-static void handleSend(std::shared_ptr<socket_t> s, const error_code& error, std::size_t bytes_transferred);
-static void handleConnect(std::shared_ptr<socket_t> s, const error_code& error);
+static void handleAccept(const std::shared_ptr<socket_t>& s, const error_code& error);
+static void handleReadHeader(const std::shared_ptr<socket_t>& s, const error_code& error, size_t bytes_transferred);
+static void handleReadBody(const std::shared_ptr<socket_t>& s, const error_code& error, std::size_t bytes_transferred);
+static void handleSend(const std::shared_ptr<socket_t>& s, const error_code& error, std::size_t bytes_transferred);
+static void handleConnect(const std::shared_ptr<socket_t>& s, const error_code& error);
 
 static void loopSendHeart();
 static void loopActiveSocket();
 
 static void defreadcb(int fd, char* buf, int len);
 static void sigclose(int fd);
+static void onCloseSlot(const std::shared_ptr<socket_t>& s);
 
-void iosev(int port)
+std::shared_ptr<Channel<std::shared_ptr<socket_t> > > closechannel = NULL;
+
+void iosev(int port, bool isblok)
 {
 	// 1. start ioservice
-	iopool.start();
+	if (iopool == NULL){
+		iopool = std::shared_ptr<io_service_pool>(new io_service_pool(CPUCOUNT));
+		iopool->start();
+	}
 
 	// 2. construction tcp::acceptor
 	if (acceptor == NULL)
-		acceptor = std::shared_ptr<tcp::acceptor>(new tcp::acceptor(iopool.get_io_service()));
+		acceptor = std::shared_ptr<tcp::acceptor>(new tcp::acceptor(iopool->get_io_service()));
 
 	// 3.listen
 	tcp::endpoint endpoint(ip::tcp::v4(), port);
@@ -114,34 +111,45 @@ void iosev(int port)
 	//	setreadcb(defreadcb);
 
 	// 4. set onclose
-	closesig.connect(&closeslot, &CloseSlot::onClose);
 
 	// 5. asyn accept
 	accept();
 
+	if (closechannel == NULL){
+		closechannel = std::shared_ptr<Channel<std::shared_ptr<socket_t> > >
+			(new Channel<std::shared_ptr<socket_t> >(std::bind(onCloseSlot, std::placeholders::_1)));
+	}
+
 	// 6. start active socket check thread
-	if (flag == 0){
-		flag = 1;
+	if (server_flag == 0){
+		server_flag = 1;
 		std::thread t(std::bind(loopActiveSocket));
 		t.detach();
 	}
 
 	// 7. waiting for service ...
-	std::unique_lock<std::mutex> lk(exitmtx);
-	exitcnd.wait(lk);
+	if (isblok){
+		std::unique_lock<std::mutex> lk(exitmtx);
+		exitcnd.wait(lk);
+	}
 }
 
 static void accept()
 {
 	std::shared_ptr<socket_t> s = std::shared_ptr<socket_t>(new socket_t);
-	s->socket = std::shared_ptr<tcp::socket>(new tcp::socket(iopool.get_io_service()));
-	s->strander = std::shared_ptr<boost::asio::strand>(new boost::asio::strand(iopool.get_io_service()));
+	s->isremote_client = false;
+	s->socket = std::shared_ptr<tcp::socket>(new tcp::socket(iopool->get_io_service()));
+	s->strander = std::shared_ptr<boost::asio::strand>(new boost::asio::strand(iopool->get_io_service()));
 	acceptor->async_accept(*s->socket, boost::bind(handleAccept, s, boost::asio::placeholders::error));
 }
 
-static void handleAccept(std::shared_ptr<socket_t> s, const boost::system::error_code& error)
+static void handleAccept(const std::shared_ptr<socket_t>& s, const boost::system::error_code& error)
 {
 	if (0 == error){
+		std::time_t now;
+		std::time(&now);
+		s->lastactivetime = now;
+		s->isremote_client = true;
 		addsocket(s);
 		readheader(s);
 	}
@@ -152,14 +160,21 @@ static void handleAccept(std::shared_ptr<socket_t> s, const boost::system::error
 int ioconnect(const char *ip, int port)
 {
 	// 1. io service start
-	iopool.start();
+	if (iopool == NULL){
+		iopool = std::shared_ptr<io_service_pool>(new io_service_pool(CPUCOUNT));
+		iopool->start();
+	}
+
+	if (closechannel == NULL){
+		closechannel = std::shared_ptr<Channel<std::shared_ptr<socket_t> > >
+			(new Channel<std::shared_ptr<socket_t> >(std::bind(onCloseSlot, std::placeholders::_1)));
+	}
 
 	// 2. set read callback
 	// if (read_pfn == NULL)
 	//	setreadcb(defreadcb);
 
 	// 2. set onclose
-	closesig.connect(&closeslot, &CloseSlot::onClose);
 
 	error_code ec;
 	tcp::endpoint endpt(boost::asio::ip::address_v4::from_string(ip, ec), port);
@@ -168,16 +183,20 @@ int ioconnect(const char *ip, int port)
 	}
 
 	std::shared_ptr<socket_t> s = std::shared_ptr<socket_t>(new socket_t);
-	s->socket = std::shared_ptr<tcp::socket>(new tcp::socket(iopool.get_io_service()));
-	s->strander = std::shared_ptr<boost::asio::strand>(new boost::asio::strand(iopool.get_io_service()));
+	s->islocal_client = false;
+	s->isremote_client = false;
+	s->socket = std::shared_ptr<tcp::socket>(new tcp::socket(iopool->get_io_service()));
+	s->strander = std::shared_ptr<boost::asio::strand>(new boost::asio::strand(iopool->get_io_service()));
 
 	// s->socket->async_connect(endpt, boost::bind(handleConnect, s, boost::asio::placeholders::error));
 	s->socket->connect(endpt, ec);
+
 	if (ec){
 		return -1;
 	}
 	else{
 		std::unique_lock<std::mutex> lk(s->mtx);
+		s->islocal_client = true;
 		s->socket->set_option(tcp::socket::reuse_address(true));
 		std::time_t now;
 		std::time(&now);
@@ -186,8 +205,8 @@ int ioconnect(const char *ip, int port)
 		readheader(s);
 	}
 
-	if (flag == 0){
-		flag = 1;
+	if (client_flag == 0){
+		client_flag = 1;
 		std::thread t(std::bind(loopSendHeart));
 		t.detach();
 	}
@@ -195,13 +214,14 @@ int ioconnect(const char *ip, int port)
 	return s->fd;
 }
 
-static void handleConnect(std::shared_ptr<socket_t> s, const error_code& error)
+static void handleConnect(const std::shared_ptr<socket_t>& s, const error_code& error)
 {
 	if (0 == error){
 		std::unique_lock<std::mutex> lk(s->mtx);
 		s->socket->set_option(tcp::socket::reuse_address(true));
 		std::time_t now;
 		std::time(&now);
+		s->islocal_client = true;
 		s->lastactivetime = now;
 		addsocket(s);
 		readheader(s);
@@ -217,7 +237,7 @@ void ioclose(int fd)
 	delsocketbyfd(fd);
 }
 
-static void addsocket(std::shared_ptr<socket_t> s)
+static void addsocket(const std::shared_ptr<socket_t>& s)
 {
 	if (s == NULL)
 		return;
@@ -231,13 +251,15 @@ static void addsocket(std::shared_ptr<socket_t> s)
 	}
 }
 
-static void delsocket(std::shared_ptr<socket_t> s)
+static void delsocket(const std::shared_ptr<socket_t>& s)
 {
 	if (s == NULL)
 		return;
 
 	int tmpfd = s->fd;
 
+	std::shared_ptr<socket_t> dels = s;
+	bool bfind = false;
 	// lock map
 	{
 		std::unique_lock<std::mutex> lk(sktmtx);
@@ -245,25 +267,36 @@ static void delsocket(std::shared_ptr<socket_t> s)
 		if (itor != fds.end()){
 			s->socket->close();
 			fds.erase(itor);
+			bfind = true;
 		}
 	}
 
-	closesig.emit(tmpfd);
+	if (bfind && dels != NULL && close_pfn != NULL && closechannel != NULL){
+		closechannel->Send(dels);
+	}
 }
 
 static void delsocketbyfd(int fd)
 {
+	bool bfind = false;
+
 	// lock map
+	std::shared_ptr<socket_t> dels = NULL;
 	{
 		std::unique_lock<std::mutex> lk(sktmtx);
 		auto itor = fds.find(fd);
 		if (itor != fds.end()){
 			itor->second->socket->close();
+			std::shared_ptr<socket_t> dels = itor->second;
 			fds.erase(itor);
+			bool bfind = true;
 		}
 	}
-
-	closesig.emit(fd);
+	
+	if (bfind && dels != NULL && close_pfn != NULL && closechannel != NULL){
+		closechannel->Send(dels);
+		//close_pfn(dels->fd, -1);
+	}
 }
 
 static std::shared_ptr<struct socket_t> getsocket(int fd)
@@ -278,13 +311,13 @@ static std::shared_ptr<struct socket_t> getsocket(int fd)
 	}
 }
 
-static void readheader(std::shared_ptr<socket_t> s)
+static void readheader(const std::shared_ptr<socket_t>& s)
 {
 	boost::asio::async_read(*s->socket, boost::asio::buffer(&s->msglen, sizeof(int32_t)),
 		s->strander->wrap(boost::bind(handleReadHeader, s, placeholders::error, placeholders::bytes_transferred)));
 }
 
-static void handleReadHeader(std::shared_ptr<socket_t> s, const boost::system::error_code& error, size_t bytes_transferred)
+static void handleReadHeader(const std::shared_ptr<socket_t>& s, const boost::system::error_code& error, size_t bytes_transferred)
 {
 	s->readlen = 0;
 	int len = ntohl(s->msglen);
@@ -310,7 +343,7 @@ static void handleReadHeader(std::shared_ptr<socket_t> s, const boost::system::e
 	}
 }
 
-static void handleReadBody(std::shared_ptr<socket_t> s, const error_code& error, std::size_t bytes_transferred)
+static void handleReadBody(const std::shared_ptr<socket_t>& s, const error_code& error, std::size_t bytes_transferred)
 {
 	if (error != 0){
 		delsocket(s);
@@ -359,7 +392,8 @@ int iosend(int fd, const char * buf, int len)
 /* send a buf to service */
 int iosendmsg(int fd, const char* msg, const char* buf, int len)
 {
-	if ((sizeof(int32_t) +len + strlen(msg) + 1) > MAX_PACKAGE_SIZE)
+	/* sizeof(int32_t) * 3 == datalen + msgname len + checksum len */
+	if ((sizeof(int32_t) * 3 +len + strlen(msg) + 1) > MAX_PACKAGE_SIZE)
 	{
 		return -2;
 	}
@@ -384,7 +418,7 @@ int iosendmsg(int fd, const char* msg, const char* buf, int len)
 	return 0;
 }
 
-static void handleSend(std::shared_ptr<socket_t> s, const error_code& error, std::size_t bytes_transferred)
+static void handleSend(const std::shared_ptr<socket_t>& s, const error_code& error, std::size_t bytes_transferred)
 {
 	if (error != 0){
 		delsocket(s);
@@ -408,7 +442,7 @@ void setclosecb(closecallback_t f)
 
 static void loopSendHeart()
 {
-	while (flag){
+	while (client_flag){
 		// printf("loop send heart\n");
 		std::map < int/*fd*/, std::shared_ptr<socket_t>> fdstmp;
 		int len = 0;
@@ -417,14 +451,15 @@ static void loopSendHeart()
 		// copy sockets 
 		{
 			std::unique_lock<std::mutex> lk(sktmtx);
-			fdstmp.insert(fds.begin(), fds.end());
+			for (auto itor = fds.begin(); itor != fds.end(); ++itor)
+			/* local client sockets */
+			if (itor->second->islocal_client){
+				fdstmp[itor->second->fd] = itor->second;
+			}
 		}
 
-		std::time_t now;
-		std::time(&now);
-
 		for (auto& fd : fdstmp){
-			// printf("fd %d send heart.\n", fd.second->fd);
+			// printf("islocal_client%d fd %d send heart.\n",fd.second->islocal_client, fd.second->fd);
 			iosend(fd.second->fd, (const char *)&heart, sizeof(int32_t));
 		}
 
@@ -434,7 +469,7 @@ static void loopSendHeart()
 
 static void loopActiveSocket()
 {
-	while (flag){
+	while (server_flag){
 		// printf("loop check heart\n");
 		std::map < int/*fd*/, std::shared_ptr<socket_t>> fdstmp;
 		Sleep(ACTIVE_TIME_OUT * 1000);
@@ -442,14 +477,23 @@ static void loopActiveSocket()
 		// copy sockets 
 		{
 			std::unique_lock<std::mutex> lk(sktmtx);
-			fdstmp.insert(fds.begin(), fds.end());
+			/* is remote sockets */
+			for (auto itor = fds.begin(); itor != fds.end(); ++itor)
+				/* local client sockets */
+			if (itor->second->isremote_client){
+				fdstmp[itor->second->fd] = itor->second;
+			}
 		}
 
 		std::time_t now;
 		std::time(&now);
 
+		// printf(" check result ---> fds size = %d , tmpsize = %d\n", fds.size(), fdstmp.size());
+
 		for (auto& fd : fdstmp){
+			// printf(" check fd %d fds size = %d , tmpsize = %d\n", fd.second->fd, fds.size(), fdstmp.size());
 			if (now - fd.second->lastactivetime > ACTIVE_TIME_OUT){
+			printf("close the check fd %d size = %d \n", fd.second->fd, fds.size());
 				delsocketbyfd(fd.second->fd);
 			}
 		}
@@ -463,6 +507,13 @@ static void defreadcb(int fd, char* buf, int len)
 	coder.decoding(buf, len);
 	printf("msg %s\n", coder.getMsgName().c_str());
 	// invorkfun(fd, coder.getMsgName(), coder.getBody());
+}
+
+static void onCloseSlot(const std::shared_ptr<socket_t>& s)
+{
+	if (s != NULL && close_pfn != NULL){
+		close_pfn(s->fd, -1);
+	}
 }
 
 #if 0
@@ -506,16 +557,16 @@ void test1(int fd, const message_t & msg)
 	printf("fd %d on test function.\n", fd);
 }
 
+
 int main()
 {
 	//registerfunc<scan_test::test>(test1);
-
 	setconnnectcb(connectcb);
 	setreadcb(readcb2);
 	setclosecb(closecb);
-#if 0
+#if 1
 	printf("connect service...\n");
-	int fd = ioconnect("127.0.0.1", 1234);
+	int fd = ioconnect("192.168.2.31", 8888);
 
 	printf("client ... \n");
 	//std::thread t(std::bind(connectthread));
